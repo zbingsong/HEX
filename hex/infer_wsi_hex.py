@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from functools import partial
 import sys
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 import numpy as np
 from PIL import Image
@@ -166,6 +167,8 @@ def create_disk_backed_level_outputs(
         dtype=skip_mask_dtype,
         shape=(rows, cols),
     )
+    predictions[...] = 0
+    skip_mask[...] = False
     return pred_path, skipmask_path, predictions, skip_mask
 
 
@@ -399,6 +402,120 @@ def read_centered_padded_patch(
     insert_x1 = insert_x0 + read_width
     patch_rgb[insert_y0:insert_y1, insert_x0:insert_x1] = region_rgb
     return patch_rgb, crop_bounds
+
+
+def collate_wsi_inference_batch(
+    batch: Sequence[WSISlidingWindowItem],
+    transform: Callable[[Image.Image], torch.Tensor],
+) -> dict[str, Any]:
+    """Collate one WSI batch into model-ready tensors plus grid metadata."""
+
+    batch_rows: list[int] = []
+    batch_cols: list[int] = []
+    infer_rows: list[int] = []
+    infer_cols: list[int] = []
+    input_tensors: list[torch.Tensor] = []
+
+    for item in batch:
+        batch_rows.append(item.row)
+        batch_cols.append(item.col)
+        if item.is_near_white:
+            continue
+        if item.patch_rgb is None:
+            raise ValueError("non-skipped WSI batch item is missing patch_rgb")
+
+        pil_patch = Image.fromarray(item.patch_rgb, mode="RGB")
+        # Model inputs are float tensors with shape (C, H, W) after the HEX eval transform.
+        input_tensors.append(transform(pil_patch))
+        infer_rows.append(item.row)
+        infer_cols.append(item.col)
+
+    inputs: torch.Tensor | None = None
+    if input_tensors:
+        inputs = torch.stack(input_tensors, dim=0)
+
+    return {
+        "rows": np.asarray(batch_rows, dtype=np.int64),
+        "cols": np.asarray(batch_cols, dtype=np.int64),
+        "infer_rows": np.asarray(infer_rows, dtype=np.int64),
+        "infer_cols": np.asarray(infer_cols, dtype=np.int64),
+        "inputs": inputs,
+    }
+
+
+def run_hex_level_inference(
+    model: torch.nn.Module,
+    dataset: Dataset[WSISlidingWindowItem],
+    transform: Callable[[Image.Image], torch.Tensor],
+    predictions: np.memmap,
+    skip_mask: np.memmap,
+    batch_size: int = 32,
+    num_workers: int = 0,
+    device: torch.device | str = "cpu",
+) -> None:
+    """Run HEX inference over one WSI dataset and fill disk-backed outputs.
+
+    ``predictions`` has shape ``(rows, cols, channels)`` and stores one marker
+    vector per output-grid location. ``skip_mask`` has shape ``(rows, cols)``
+    and marks locations filtered by the near-white heuristic.
+    """
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if predictions.ndim != 3:
+        raise ValueError("predictions must have shape (rows, cols, channels)")
+    if skip_mask.ndim != 2:
+        raise ValueError("skip_mask must have shape (rows, cols)")
+    if predictions.shape[:2] != skip_mask.shape:
+        raise ValueError("predictions and skip_mask grid shapes must match")
+
+    device = torch.device(device)
+    model = model.to(device)
+    model.eval()
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=partial(collate_wsi_inference_batch, transform=transform),
+    )
+    autocast_enabled = device.type == "cuda"
+
+    with torch.no_grad():
+        for batch in dataloader:
+            rows = batch["rows"]
+            cols = batch["cols"]
+            infer_rows = batch["infer_rows"]
+            infer_cols = batch["infer_cols"]
+            inputs = batch["inputs"]
+
+            skipped_positions = np.ones(rows.shape[0], dtype=bool)
+            for infer_row, infer_col in zip(infer_rows, infer_cols):
+                skipped_positions &= ~((rows == infer_row) & (cols == infer_col))
+            skip_mask[rows, cols] = skipped_positions
+
+            if inputs is None:
+                continue
+
+            inputs = inputs.to(device, non_blocking=device.type == "cuda")
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=autocast_enabled,
+            ):
+                outputs, _ = model(inputs)
+
+            batch_predictions = outputs.detach().to(dtype=torch.float32).cpu().numpy()
+            predictions[infer_rows, infer_cols] = batch_predictions.astype(
+                predictions.dtype,
+                copy=False,
+            )
+
+    predictions.flush()
+    skip_mask.flush()
 
 
 def is_near_white_patch(
