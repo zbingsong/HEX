@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import numpy as np
+from PIL import Image
 import torch
 from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
@@ -188,22 +189,40 @@ class SupportsLevelDimensions(Protocol):
     level_dimensions: Sequence[tuple[int, int]]
 
 
+class SupportsWSIReadRegion(SupportsLevelDimensions, Protocol):
+    """Minimal slide protocol for region reads across pyramid levels."""
+
+    level_downsamples: Sequence[float]
+
+    def read_region(
+        self,
+        location: tuple[int, int],
+        level: int,
+        size: tuple[int, int],
+    ) -> Image.Image:
+        """Read one region from the slide pyramid."""
+
+
 @dataclass(frozen=True, slots=True)
 class WSISlidingWindowItem:
-    """Index metadata for one output-grid location."""
+    """One centered patch request and its extracted payload, if available."""
 
     index: int
     row: int
     col: int
     center_x: int
     center_y: int
+    patch_rgb: np.ndarray | None = None
+    crop_bounds: PaddedCropBounds | None = None
+    is_near_white: bool = False
 
 
 class WSISlidingWindowDataset(Dataset):
-    """Dense sliding-window index shell for one WSI level.
+    """Dense sliding-window dataset for one WSI level.
 
-    The dataset only computes output-grid indexing and level-space center
-    coordinates. Patch reading and inference are deferred to later tasks.
+    Each item is aligned to one output-grid location in stride space. When the
+    provided slide implements ``read_region``, the dataset also returns the
+    centered RGB patch, symmetric padding metadata, and a near-white skip flag.
     """
 
     def __init__(
@@ -257,13 +276,129 @@ class WSISlidingWindowDataset(Dataset):
         center_x, center_y = output_grid_index_to_center_coordinates(
             row, col, self.stride
         )
-        return WSISlidingWindowItem(
+        item = WSISlidingWindowItem(
             index=index,
             row=row,
             col=col,
             center_x=center_x,
             center_y=center_y,
         )
+        if not hasattr(self.slide, "read_region"):
+            return item
+
+        patch_rgb, crop_bounds = read_centered_padded_patch(
+            slide=self.slide,
+            level=self.level,
+            center_x=center_x,
+            center_y=center_y,
+            patch_size=self.patch_size,
+            width=self.width,
+            height=self.height,
+        )
+        return WSISlidingWindowItem(
+            index=item.index,
+            row=item.row,
+            col=item.col,
+            center_x=item.center_x,
+            center_y=item.center_y,
+            patch_rgb=patch_rgb,
+            crop_bounds=crop_bounds,
+            is_near_white=is_near_white_patch(
+                patch_rgb,
+                threshold=self.white_threshold,
+                min_white_fraction=self.min_white_fraction,
+            ),
+        )
+
+
+def _get_level_downsample(slide: SupportsLevelDimensions, level: int) -> float:
+    """Return the level downsample, defaulting to ``1.0`` for test doubles."""
+
+    level_downsamples = getattr(slide, "level_downsamples", None)
+    if level_downsamples is None:
+        return 1.0
+
+    try:
+        downsample = float(level_downsamples[level])
+    except IndexError as exc:
+        raise IndexError(
+            f"level {level} is out of range for slide.level_downsamples"
+        ) from exc
+
+    if downsample <= 0:
+        raise ValueError("slide level downsample must be positive")
+    return downsample
+
+
+def _region_to_rgb_array(region: Image.Image | np.ndarray) -> np.ndarray:
+    """Convert one slide region into a ``uint8`` RGB array."""
+
+    if isinstance(region, np.ndarray):
+        region_array = np.asarray(region)
+        if region_array.ndim != 3 or region_array.shape[-1] not in (3, 4):
+            raise ValueError("region array must have shape (height, width, 3|4)")
+        if region_array.dtype != np.uint8:
+            region_array = region_array.astype(np.uint8, copy=False)
+        if region_array.shape[-1] == 4:
+            region_array = region_array[..., :3]
+        return region_array
+
+    return np.asarray(region.convert("RGB"), dtype=np.uint8)
+
+
+def read_centered_padded_patch(
+    slide: SupportsLevelDimensions,
+    level: int,
+    center_x: int,
+    center_y: int,
+    patch_size: int,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, PaddedCropBounds]:
+    """Read one centered RGB patch with symmetric white padding.
+
+    Returns a ``uint8`` array with shape ``(patch_size, patch_size, 3)`` in
+    ``RGB`` order plus the in-bounds crop metadata used to place it.
+    """
+
+    if not hasattr(slide, "read_region"):
+        raise TypeError("slide must provide read_region() for patch extraction")
+
+    crop_bounds = compute_padded_crop_bounds(
+        center_x=center_x,
+        center_y=center_y,
+        patch_size=patch_size,
+        width=width,
+        height=height,
+    )
+    read_width = crop_bounds.read_x1 - crop_bounds.read_x0
+    read_height = crop_bounds.read_y1 - crop_bounds.read_y0
+
+    # The patch canvas is always full-sized in level space: (H, W, C) uint8 RGB.
+    patch_rgb = np.full((patch_size, patch_size, 3), 255, dtype=np.uint8)
+    if read_width == 0 or read_height == 0:
+        return patch_rgb, crop_bounds
+
+    level_downsample = _get_level_downsample(slide, level)
+    level0_x = int(round(crop_bounds.read_x0 * level_downsample))
+    level0_y = int(round(crop_bounds.read_y0 * level_downsample))
+    region = slide.read_region(
+        (level0_x, level0_y),
+        level,
+        (read_width, read_height),
+    )
+    region_rgb = _region_to_rgb_array(region)
+    if region_rgb.shape != (read_height, read_width, 3):
+        raise ValueError(
+            "slide region shape does not match requested crop size"
+        )
+
+    insert_y0 = crop_bounds.pad_top
+    insert_x0 = crop_bounds.pad_left
+    insert_y1 = insert_y0 + read_height
+    insert_x1 = insert_x0 + read_width
+    patch_rgb[insert_y0:insert_y1, insert_x0:insert_x1] = region_rgb
+    return patch_rgb, crop_bounds
 
 
 def is_near_white_patch(
