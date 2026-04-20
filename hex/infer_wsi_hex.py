@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import sys
 from pathlib import Path
+
+
+@dataclass(frozen=True, slots=True)
+class PaddedCropBounds:
+    """Bounds and padding needed to realize a centered patch request."""
+
+    read_x0: int
+    read_y0: int
+    read_x1: int
+    read_y1: int
+    pad_left: int
+    pad_top: int
+    pad_right: int
+    pad_bottom: int
 
 
 def compute_output_grid_shape(width: int, height: int, stride: int) -> tuple[int, int]:
@@ -39,6 +54,55 @@ def output_grid_index_to_center_coordinates(
         raise ValueError("row and col must be non-negative")
 
     return col * stride, row * stride
+
+
+def compute_padded_crop_bounds(
+    center_x: int,
+    center_y: int,
+    patch_size: int,
+    width: int,
+    height: int,
+) -> PaddedCropBounds:
+    """Return the in-bounds crop and padding for a centered patch request.
+
+    The returned object captures the readable region inside the WSI together
+    with the padding required on each side to reconstruct the full centered
+    patch.
+    """
+
+    if patch_size <= 0:
+        raise ValueError("patch_size must be positive")
+    if width < 0 or height < 0:
+        raise ValueError("width and height must be non-negative")
+    if center_x < 0 or center_y < 0:
+        raise ValueError("center_x and center_y must be non-negative")
+
+    half_size = patch_size // 2
+    requested_x0 = center_x - half_size
+    requested_y0 = center_y - half_size
+    requested_x1 = requested_x0 + patch_size
+    requested_y1 = requested_y0 + patch_size
+
+    read_x0 = max(requested_x0, 0)
+    read_y0 = max(requested_y0, 0)
+    read_x1 = min(requested_x1, width)
+    read_y1 = min(requested_y1, height)
+
+    pad_left = read_x0 - requested_x0
+    pad_top = read_y0 - requested_y0
+    pad_right = requested_x1 - read_x1
+    pad_bottom = requested_y1 - read_y1
+
+    return PaddedCropBounds(
+        read_x0=read_x0,
+        read_y0=read_y0,
+        read_x1=read_x1,
+        read_y1=read_y1,
+        pad_left=pad_left,
+        pad_top=pad_top,
+        pad_right=pad_right,
+        pad_bottom=pad_bottom,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
