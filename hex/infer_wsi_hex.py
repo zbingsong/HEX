@@ -6,8 +6,10 @@ import argparse
 from dataclasses import dataclass
 import sys
 from pathlib import Path
+from typing import Protocol, Sequence
 
 import numpy as np
+from torch.utils.data import Dataset
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +24,90 @@ class PaddedCropBounds:
     pad_top: int
     pad_right: int
     pad_bottom: int
+
+
+class SupportsLevelDimensions(Protocol):
+    """Minimal slide protocol for level-dimension lookups."""
+
+    level_dimensions: Sequence[tuple[int, int]]
+
+
+@dataclass(frozen=True, slots=True)
+class WSISlidingWindowItem:
+    """Index metadata for one output-grid location."""
+
+    index: int
+    row: int
+    col: int
+    center_x: int
+    center_y: int
+
+
+class WSISlidingWindowDataset(Dataset):
+    """Dense sliding-window index shell for one WSI level.
+
+    The dataset only computes output-grid indexing and level-space center
+    coordinates. Patch reading and inference are deferred to later tasks.
+    """
+
+    def __init__(
+        self,
+        slide: SupportsLevelDimensions,
+        level: int,
+        patch_size: int = 224,
+        stride: int = 4,
+        white_threshold: int = 240,
+        min_white_fraction: float = 0.98,
+    ) -> None:
+        if patch_size <= 0:
+            raise ValueError("patch_size must be positive")
+        if stride <= 0:
+            raise ValueError("stride must be positive")
+        if white_threshold < 0 or white_threshold > 255:
+            raise ValueError("white_threshold must be between 0 and 255")
+        if min_white_fraction < 0.0 or min_white_fraction > 1.0:
+            raise ValueError("min_white_fraction must be between 0 and 1")
+
+        try:
+            width, height = slide.level_dimensions[level]
+        except IndexError as exc:
+            raise IndexError(
+                f"level {level} is out of range for slide.level_dimensions"
+            ) from exc
+
+        self.slide = slide
+        self.level = level
+        self.patch_size = patch_size
+        self.stride = stride
+        self.white_threshold = white_threshold
+        self.min_white_fraction = min_white_fraction
+        self.width = int(width)
+        self.height = int(height)
+        self.grid_rows, self.grid_cols = compute_output_grid_shape(
+            self.width, self.height, self.stride
+        )
+
+    def __len__(self) -> int:
+        return self.grid_rows * self.grid_cols
+
+    def __getitem__(self, index: int) -> WSISlidingWindowItem:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("dataset index out of range")
+
+        row = index // self.grid_cols
+        col = index % self.grid_cols
+        center_x, center_y = output_grid_index_to_center_coordinates(
+            row, col, self.stride
+        )
+        return WSISlidingWindowItem(
+            index=index,
+            row=row,
+            col=col,
+            center_x=center_x,
+            center_y=center_y,
+        )
 
 
 def is_near_white_patch(
