@@ -9,7 +9,76 @@ from pathlib import Path
 from typing import Protocol, Sequence
 
 import numpy as np
+from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+from torchvision import transforms
 from torch.utils.data import Dataset
+
+
+HEX_BIOMARKER_NAMES: dict[int, str] = {
+    1: "DAPI",
+    2: "CD8",
+    3: "Pan-Cytokeratin",
+    4: "CD3e",
+    5: "CD163",
+    6: "CD20",
+    7: "CD4",
+    8: "FAP",
+    9: "CD138",
+    10: "CD11c",
+    11: "CD66b",
+    12: "aSMA",
+    13: "CD68",
+    14: "Ki67",
+    15: "CD31",
+    16: "Collagen IV",
+    17: "Granzyme B",
+    18: "MMP9",
+    19: "PD-1",
+    20: "CD44",
+    21: "PD-L1",
+    22: "E-cadherin",
+    23: "LAG3",
+    24: "Mac2/Galectin-3",
+    25: "FOXP3",
+    26: "CD14",
+    27: "EpCAM",
+    28: "CD21",
+    29: "CD45",
+    30: "MPO",
+    31: "TCF-1",
+    32: "ICOS",
+    33: "Bcl-2",
+    34: "HLA-E",
+    35: "CD45RO",
+    36: "VISTA",
+    37: "HIF1A",
+    38: "CD39",
+    39: "CD40",
+    40: "HLA-DR",
+}
+
+HEX_BIOMARKER_COUNT = len(HEX_BIOMARKER_NAMES)
+HEX_LABEL_COLUMNS: tuple[str, ...] = tuple(
+    f"mean_intensity_channel{i}" for i in range(1, HEX_BIOMARKER_COUNT + 1)
+)
+
+
+def build_hex_eval_transform(image_size: int = 384) -> transforms.Compose:
+    """Return the HEX eval transform used for codex patch inference."""
+
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=IMAGENET_INCEPTION_MEAN,
+                std=IMAGENET_INCEPTION_STD,
+            ),
+        ]
+    )
 
 
 @dataclass(frozen=True, slots=True)
