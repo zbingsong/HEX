@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from functools import partial
+import json
 import sys
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
@@ -518,6 +519,194 @@ def run_hex_level_inference(
     skip_mask.flush()
 
 
+def resolve_default_device(device: str) -> torch.device:
+    """Resolve the requested inference device."""
+
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+def open_wsi_slide(wsi_path: Path) -> Any:
+    """Open one WSI via OpenSlide with a runtime import."""
+
+    try:
+        import openslide
+    except ImportError as exc:
+        raise RuntimeError(
+            "openslide is required to read WSI files; install openslide-python"
+        ) from exc
+
+    return openslide.open_slide(str(wsi_path))
+
+
+def write_level_prediction_metadata(
+    output_dir: Path,
+    slide_id: str,
+    level: int,
+    wsi_path: Path,
+    checkpoint_path: Path,
+    width: int,
+    height: int,
+    output_rows: int,
+    output_cols: int,
+    patch_size: int,
+    stride: int,
+    white_threshold: int,
+    min_white_fraction: float,
+) -> Path:
+    """Persist one JSON sidecar describing one level's prediction raster."""
+
+    metadata_path = output_dir / f"{slide_id}_level{level}_metadata.json"
+    metadata = {
+        "slide_id": slide_id,
+        "level": level,
+        "wsi_path": str(wsi_path),
+        "checkpoint_path": str(checkpoint_path),
+        "level_dimensions": {"width": width, "height": height},
+        "output_grid_shape": {"rows": output_rows, "cols": output_cols},
+        "patch_size": patch_size,
+        "stride": stride,
+        "white_threshold": white_threshold,
+        "min_white_fraction": min_white_fraction,
+        "biomarker_names": [HEX_BIOMARKER_NAMES[i] for i in sorted(HEX_BIOMARKER_NAMES)],
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata_path
+
+
+def write_prediction_ome_tiff(
+    level_prediction_paths: Sequence[Path],
+    output_path: Path,
+    channel_names: Sequence[str],
+) -> Path:
+    """Write one OME-TIFF containing one series per prediction level."""
+
+    if not level_prediction_paths:
+        raise ValueError("at least one prediction path is required")
+
+    try:
+        import tifffile
+    except ImportError as exc:
+        raise RuntimeError(
+            "tifffile is required for OME-TIFF export; install tifffile"
+        ) from exc
+
+    with tifffile.TiffWriter(output_path, ome=True, bigtiff=True) as tif:
+        for level_index, prediction_path in enumerate(level_prediction_paths):
+            level_predictions = np.load(prediction_path, mmap_mode="r")
+            if level_predictions.ndim != 3:
+                raise ValueError(
+                    "level prediction arrays must have shape (rows, cols, channels)"
+                )
+            if level_predictions.shape[2] != len(channel_names):
+                raise ValueError("channel_names length does not match prediction channels")
+
+            # OME expects channel-first storage here: (C, Y, X).
+            # tifffile's OME writer does not support float16 Pixels, so export
+            # as float32 while keeping the on-disk `.npy` tensors in float16.
+            cyx_predictions = np.moveaxis(level_predictions, -1, 0).astype(
+                np.float32,
+                copy=False,
+            )
+            metadata = {
+                "axes": "CYX",
+                "Channel": {"Name": list(channel_names)},
+                "Name": prediction_path.stem,
+            }
+            tif.write(
+                cyx_predictions,
+                metadata=metadata,
+                photometric="minisblack",
+                contiguous=level_index == 0,
+            )
+
+    return output_path
+
+
+def run_wsi_hex_inference(
+    *,
+    wsi_path: Path,
+    checkpoint_path: Path,
+    output_dir: Path,
+    level: int,
+    patch_size: int,
+    stride: int,
+    batch_size: int,
+    num_workers: int,
+    image_size: int,
+    device: str,
+    white_threshold: int,
+    min_white_fraction: float,
+) -> dict[str, Path]:
+    """Run the current single-level HEX WSI inference pipeline."""
+
+    slide_id = wsi_path.stem
+    output_dir.mkdir(parents=True, exist_ok=True)
+    slide = open_wsi_slide(wsi_path)
+    try:
+        dataset = WSISlidingWindowDataset(
+            slide=slide,
+            level=level,
+            patch_size=patch_size,
+            stride=stride,
+            white_threshold=white_threshold,
+            min_white_fraction=min_white_fraction,
+        )
+        model = load_hex_wsi_model(checkpoint_path)
+        transform = build_hex_eval_transform(image_size=image_size)
+        _, _, predictions, skip_mask = create_disk_backed_level_outputs(
+            output_dir=output_dir,
+            slide_id=slide_id,
+            level=level,
+            rows=dataset.grid_rows,
+            cols=dataset.grid_cols,
+        )
+        run_hex_level_inference(
+            model=model,
+            dataset=dataset,
+            transform=transform,
+            predictions=predictions,
+            skip_mask=skip_mask,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=resolve_default_device(device),
+        )
+    finally:
+        close = getattr(slide, "close", None)
+        if callable(close):
+            close()
+
+    pred_path = output_dir / f"{slide_id}_level{level}_pred.npy"
+    skipmask_path = output_dir / f"{slide_id}_level{level}_skipmask.npy"
+    metadata_path = write_level_prediction_metadata(
+        output_dir=output_dir,
+        slide_id=slide_id,
+        level=level,
+        wsi_path=wsi_path,
+        checkpoint_path=checkpoint_path,
+        width=dataset.width,
+        height=dataset.height,
+        output_rows=dataset.grid_rows,
+        output_cols=dataset.grid_cols,
+        patch_size=patch_size,
+        stride=stride,
+        white_threshold=white_threshold,
+        min_white_fraction=min_white_fraction,
+    )
+    ome_tiff_path = write_prediction_ome_tiff(
+        level_prediction_paths=[pred_path],
+        output_path=output_dir / f"{slide_id}.ome.tiff",
+        channel_names=[HEX_BIOMARKER_NAMES[i] for i in sorted(HEX_BIOMARKER_NAMES)],
+    )
+    return {
+        "prediction_npy": pred_path,
+        "skipmask_npy": skipmask_path,
+        "metadata_json": metadata_path,
+        "ome_tiff": ome_tiff_path,
+    }
+
+
 def is_near_white_patch(
     patch: np.ndarray,
     threshold: int = 240,
@@ -638,17 +827,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--level", type=int, default=0)
     parser.add_argument("--patch-size", type=int, default=224)
     parser.add_argument("--stride", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--white-threshold", type=int, default=240)
+    parser.add_argument("--min-white-fraction", type=float, default=0.98)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse CLI arguments and validate the WSI path."""
+    """Parse CLI arguments and run the single-level HEX WSI pipeline."""
 
     args = build_parser().parse_args(argv)
 
     if not args.wsi_path.exists():
         print("WSI path does not exist", file=sys.stderr)
         return 1
+    if not args.checkpoint_path.exists():
+        print("Checkpoint path does not exist", file=sys.stderr)
+        return 1
+
+    try:
+        outputs = run_wsi_hex_inference(
+            wsi_path=args.wsi_path,
+            checkpoint_path=args.checkpoint_path,
+            output_dir=args.output_dir,
+            level=args.level,
+            patch_size=args.patch_size,
+            stride=args.stride,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            image_size=args.image_size,
+            device=args.device,
+            white_threshold=args.white_threshold,
+            min_white_fraction=args.min_white_fraction,
+        )
+    except Exception as exc:
+        print(f"HEX WSI inference failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(str(outputs["prediction_npy"]))
+    print(str(outputs["skipmask_npy"]))
+    print(str(outputs["ome_tiff"]))
 
     return 0
 
