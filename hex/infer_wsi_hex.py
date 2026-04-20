@@ -6,12 +6,13 @@ import argparse
 from dataclasses import dataclass
 import sys
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import numpy as np
 from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
 from torch.utils.data import Dataset
+from numpy.lib.format import open_memmap
 
 
 HEX_BIOMARKER_NAMES: dict[int, str] = {
@@ -79,6 +80,51 @@ def build_hex_eval_transform(image_size: int = 384) -> transforms.Compose:
             ),
         ]
     )
+
+
+def create_disk_backed_level_outputs(
+    output_dir: Path,
+    slide_id: str,
+    level: int,
+    rows: int,
+    cols: int,
+    channels: int = HEX_BIOMARKER_COUNT,
+    prediction_dtype: np.dtype[Any] | type[np.floating] = np.float16,
+    skip_mask_dtype: np.dtype[Any] | type[np.bool_] = np.bool_,
+) -> tuple[Path, Path, np.memmap, np.memmap]:
+    """Create `.npy`-backed arrays for one WSI level's outputs.
+
+    The prediction raster is shaped ``(rows, cols, channels)`` and the skip
+    mask is shaped ``(rows, cols)``. Both arrays are created in ``w+`` mode so
+    they can be filled incrementally and flushed to disk later.
+    """
+
+    if not slide_id:
+        raise ValueError("slide_id must be non-empty")
+    if level < 0:
+        raise ValueError("level must be non-negative")
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows and cols must be positive")
+    if channels <= 0:
+        raise ValueError("channels must be positive")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pred_path = output_dir / f"{slide_id}_level{level}_pred.npy"
+    skipmask_path = output_dir / f"{slide_id}_level{level}_skipmask.npy"
+
+    predictions = open_memmap(
+        pred_path,
+        mode="w+",
+        dtype=prediction_dtype,
+        shape=(rows, cols, channels),
+    )
+    skip_mask = open_memmap(
+        skipmask_path,
+        mode="w+",
+        dtype=skip_mask_dtype,
+        shape=(rows, cols),
+    )
+    return pred_path, skipmask_path, predictions, skip_mask
 
 
 @dataclass(frozen=True, slots=True)
