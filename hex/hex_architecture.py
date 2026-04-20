@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from timm import create_model
-import musk_utils
+from . import musk_utils
 
 
 class CustomModel(nn.Module):

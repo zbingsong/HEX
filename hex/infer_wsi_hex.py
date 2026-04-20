@@ -9,10 +9,17 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import numpy as np
+import torch
 from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from torchvision import transforms
 from torch.utils.data import Dataset
 from numpy.lib.format import open_memmap
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from hex.hex_architecture import CustomModel
+else:
+    from .hex_architecture import CustomModel
 
 
 HEX_BIOMARKER_NAMES: dict[int, str] = {
@@ -62,6 +69,8 @@ HEX_BIOMARKER_COUNT = len(HEX_BIOMARKER_NAMES)
 HEX_LABEL_COLUMNS: tuple[str, ...] = tuple(
     f"mean_intensity_channel{i}" for i in range(1, HEX_BIOMARKER_COUNT + 1)
 )
+HEX_MODEL_VISUAL_OUTPUT_DIM = 1024
+HEX_MODEL_NUM_OUTPUTS = HEX_BIOMARKER_COUNT
 
 
 def build_hex_eval_transform(image_size: int = 384) -> transforms.Compose:
@@ -80,6 +89,38 @@ def build_hex_eval_transform(image_size: int = 384) -> transforms.Compose:
             ),
         ]
     )
+
+
+def _unwrap_hex_checkpoint_state_dict(checkpoint: Any) -> Any:
+    """Return the state dict from a supported HEX checkpoint wrapper."""
+
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+
+    for wrapper_key in ("state_dict", "model_state_dict", "model", "module"):
+        wrapped_state_dict = checkpoint.get(wrapper_key)
+        if isinstance(wrapped_state_dict, dict):
+            return wrapped_state_dict
+
+    return checkpoint
+
+
+def load_hex_wsi_model(checkpoint_path: Path) -> CustomModel:
+    """Load the HEX WSI model on CPU and switch it to eval mode.
+
+    The helper mirrors the repo's existing `CustomModel` shape assumptions:
+    `visual_output_dim=1024` and `num_outputs=40`.
+    """
+
+    model = CustomModel(
+        visual_output_dim=HEX_MODEL_VISUAL_OUTPUT_DIM,
+        num_outputs=HEX_MODEL_NUM_OUTPUTS,
+    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _unwrap_hex_checkpoint_state_dict(checkpoint)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model
 
 
 def create_disk_backed_level_outputs(
