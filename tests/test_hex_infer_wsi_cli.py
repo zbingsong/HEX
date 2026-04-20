@@ -42,6 +42,28 @@ def test_hex_infer_wsi_cli_rejects_missing_checkpoint(tmp_path: Path) -> None:
     assert exit_code == 1
 
 
+def test_hex_infer_wsi_cli_rejects_negative_level(tmp_path: Path) -> None:
+    wsi_path = tmp_path / "slide.svs"
+    wsi_path.write_bytes(b"")
+    checkpoint_path = tmp_path / "checkpoint.pth"
+    checkpoint_path.write_bytes(b"")
+
+    exit_code = infer_wsi_hex.main(
+        [
+            "--wsi-path",
+            str(wsi_path),
+            "--checkpoint-path",
+            str(checkpoint_path),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--level",
+            "-1",
+        ]
+    )
+
+    assert exit_code == 1
+
+
 def test_hex_infer_wsi_cli_uses_default_arguments(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

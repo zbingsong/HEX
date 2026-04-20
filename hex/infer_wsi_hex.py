@@ -238,6 +238,8 @@ class WSISlidingWindowDataset(Dataset):
         white_threshold: int = 240,
         min_white_fraction: float = 0.98,
     ) -> None:
+        if level < 0:
+            raise ValueError("level must be non-negative")
         if patch_size <= 0:
             raise ValueError("patch_size must be positive")
         if stride <= 0:
@@ -846,6 +848,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not args.checkpoint_path.exists():
         print("Checkpoint path does not exist", file=sys.stderr)
+        return 1
+    if args.level < 0:
+        print("Level must be non-negative", file=sys.stderr)
         return 1
 
     try:

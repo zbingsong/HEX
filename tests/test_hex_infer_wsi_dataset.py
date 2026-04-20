@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from hex.infer_wsi_hex import WSISlidingWindowDataset, WSISlidingWindowItem
 
 
@@ -64,3 +66,15 @@ def test_wsi_sliding_window_dataset_maps_indices_across_a_dense_grid() -> None:
     assert dataset[5].col == 2
     assert dataset[5].center_x == 8
     assert dataset[5].center_y == 4
+
+
+def test_wsi_sliding_window_dataset_rejects_negative_level() -> None:
+    slide = FakeSlide(level_dimensions=((9, 5), (4, 3)))
+
+    with pytest.raises(ValueError, match="level must be non-negative"):
+        WSISlidingWindowDataset(
+            slide=slide,
+            level=-1,
+            patch_size=224,
+            stride=4,
+        )
