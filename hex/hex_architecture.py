@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from timm import create_model
-from musk import utils
+import musk_utils
 
 
 class CustomModel(nn.Module):
@@ -11,7 +11,7 @@ class CustomModel(nn.Module):
         super(CustomModel, self).__init__()
         model_config = "musk_large_patch16_384"
         model_musk = create_model(model_config, vocab_size=64010)
-        utils.load_model_and_may_interpolate("hf_hub:xiangjx/musk", model_musk, 'model|module', '')
+        musk_utils.load_model_and_may_interpolate("checkpoint.pth", model_musk, 'model|module', '')
         self.visual = model_musk
         self.regression_head = nn.Sequential(
             nn.Linear(visual_output_dim, 256),
