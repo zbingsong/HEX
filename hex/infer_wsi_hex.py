@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import sys
 from pathlib import Path
 
+import numpy as np
+
 
 @dataclass(frozen=True, slots=True)
 class PaddedCropBounds:
@@ -20,6 +22,33 @@ class PaddedCropBounds:
     pad_top: int
     pad_right: int
     pad_bottom: int
+
+
+def is_near_white_patch(
+    patch: np.ndarray,
+    threshold: int = 240,
+    min_white_fraction: float = 0.98,
+) -> bool:
+    """Return ``True`` when an RGB patch is skippable as near-white background.
+
+    A patch qualifies when at least ``min_white_fraction`` of its pixels have
+    all three RGB channels strictly greater than ``threshold``.
+    """
+
+    if threshold < 0 or threshold > 255:
+        raise ValueError("threshold must be between 0 and 255")
+    if min_white_fraction < 0.0 or min_white_fraction > 1.0:
+        raise ValueError("min_white_fraction must be between 0 and 1")
+
+    rgb_patch = np.asarray(patch)
+    if rgb_patch.ndim != 3 or rgb_patch.shape[-1] != 3:
+        raise ValueError("patch must have shape (height, width, 3)")
+    if rgb_patch.size == 0:
+        return False
+
+    white_pixels = np.all(rgb_patch > threshold, axis=-1)
+    white_fraction = np.count_nonzero(white_pixels) / white_pixels.size
+    return white_fraction >= min_white_fraction
 
 
 def compute_output_grid_shape(width: int, height: int, stride: int) -> tuple[int, int]:
