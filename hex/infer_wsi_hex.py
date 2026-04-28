@@ -9,6 +9,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
+import xml.etree.ElementTree as ET
 
 import numpy as np
 from PIL import Image
@@ -594,36 +595,109 @@ def write_prediction_ome_tiff(
             "tifffile is required for OME-TIFF export; install tifffile"
         ) from exc
 
-    with tifffile.TiffWriter(output_path, ome=True, bigtiff=True) as tif:
-        for level_index, prediction_path in enumerate(level_prediction_paths):
-            level_predictions = np.load(prediction_path, mmap_mode="r")
-            if level_predictions.ndim != 3:
-                raise ValueError(
-                    "level prediction arrays must have shape (rows, cols, channels)"
-                )
-            if level_predictions.shape[2] != len(channel_names):
-                raise ValueError("channel_names length does not match prediction channels")
-
-            # OME expects channel-first storage here: (C, Y, X).
-            # tifffile's OME writer does not support float16 Pixels, so export
-            # as float32 while keeping the on-disk `.npy` tensors in float16.
-            cyx_predictions = np.moveaxis(level_predictions, -1, 0).astype(
-                np.float32,
-                copy=False,
+    cyx_levels: list[np.ndarray] = []
+    for prediction_path in level_prediction_paths:
+        level_predictions = np.load(prediction_path, mmap_mode="r")
+        if level_predictions.ndim != 3:
+            raise ValueError(
+                "level prediction arrays must have shape (rows, cols, channels)"
             )
-            metadata = {
-                "axes": "CYX",
-                "Channel": {"Name": list(channel_names)},
-                "Name": prediction_path.stem,
-            }
-            tif.write(
+        if level_predictions.shape[2] != len(channel_names):
+            raise ValueError("channel_names length does not match prediction channels")
+
+        # OME stores this as channel-first (C, Y, X). OME Pixels does not define
+        # float16, so export as float32 while keeping `.npy` tensors in float16.
+        cyx_levels.append(
+            np.moveaxis(level_predictions, -1, 0).astype(np.float32, copy=False)
+        )
+
+    ome_xml = build_prediction_ome_xml(
+        level_names=[path.stem for path in level_prediction_paths],
+        level_shapes=[level.shape for level in cyx_levels],
+        channel_names=channel_names,
+    )
+    with tifffile.TiffWriter(str(output_path), bigtiff=True) as tif:
+        for level_index, cyx_predictions in enumerate(cyx_levels):
+            tif.save(
                 cyx_predictions,
-                metadata=metadata,
                 photometric="minisblack",
+                metadata={"axes": "CYX"},
+                description=ome_xml if level_index == 0 else None,
                 contiguous=level_index == 0,
             )
 
     return output_path
+
+
+def build_prediction_ome_xml(
+    level_names: Sequence[str],
+    level_shapes: Sequence[tuple[int, ...]],
+    channel_names: Sequence[str],
+) -> str:
+    """Build OME-XML metadata for channel-first prediction arrays."""
+
+    if len(level_names) != len(level_shapes):
+        raise ValueError("level_names and level_shapes must have the same length")
+
+    namespace = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+    ET.register_namespace("", namespace)
+    ome = ET.Element(f"{{{namespace}}}OME")
+    ifd_offset = 0
+    for level_index, (level_name, level_shape) in enumerate(
+        zip(level_names, level_shapes)
+    ):
+        if len(level_shape) != 3:
+            raise ValueError("level shapes must be (channels, rows, cols)")
+        channels, rows, cols = level_shape
+        if channels != len(channel_names):
+            raise ValueError("channel_names length does not match level shape")
+
+        image = ET.SubElement(
+            ome,
+            f"{{{namespace}}}Image",
+            {"ID": f"Image:{level_index}", "Name": level_name},
+        )
+        pixels = ET.SubElement(
+            image,
+            f"{{{namespace}}}Pixels",
+            {
+                "ID": f"Pixels:{level_index}",
+                "DimensionOrder": "XYCZT",
+                "Type": "float",
+                "SizeX": str(cols),
+                "SizeY": str(rows),
+                "SizeC": str(channels),
+                "SizeZ": "1",
+                "SizeT": "1",
+            },
+        )
+        for channel_index, channel_name in enumerate(channel_names):
+            ET.SubElement(
+                pixels,
+                f"{{{namespace}}}Channel",
+                {
+                    "ID": f"Channel:{level_index}:{channel_index}",
+                    "Name": channel_name,
+                    "SamplesPerPixel": "1",
+                },
+            )
+        ET.SubElement(
+            pixels,
+            f"{{{namespace}}}TiffData",
+            {
+                "IFD": str(ifd_offset),
+                "FirstC": "0",
+                "FirstZ": "0",
+                "FirstT": "0",
+                "PlaneCount": str(channels),
+            },
+        )
+        ifd_offset += channels
+
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
+        ome,
+        encoding="unicode",
+    )
 
 
 def run_wsi_hex_inference(
